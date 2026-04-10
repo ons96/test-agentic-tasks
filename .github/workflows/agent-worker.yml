@@ -31,7 +31,7 @@ jobs:
     permissions:
       contents: write
       issues: write
-      pull_requests: write
+      pull-requests: write
       actions: read
 
     steps:
