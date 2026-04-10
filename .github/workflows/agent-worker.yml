@@ -1,0 +1,453 @@
+name: Autonomous Coding Agent
+
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Task description for the agent'
+        required: true
+        type: string
+      task_id:
+        description: 'Unique task identifier'
+        required: true
+        type: string
+
+# Permissions needed for the agent
+permissions:
+  contents: write      # Create commits, push to branches
+  issues: write        # Comment on issues, add labels
+  pull_requests: write # Create and manage PRs
+  actions: read        # Read workflow info
+
+env:
+  # Provider Configuration - Uses free tier providers
+  # Primary: Groq (most generous free tier)
+  OPENAI_BASE_URL: https://api.groq.com/openai/v1
+  OPENAI_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
+  # Fallback providers
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+  OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+  # Already configured providers (check free status)
+  SUPACODER_API_KEY: ${{ secrets.SUPACODER_API_KEY }}
+  BLAZE_API_KEY: ${{ secrets.BLAZE_API_KEY }}
+
+  # Task tracking
+  TASK_ID: ${{ github.event.inputs.task_id || 'auto' }}
+
+jobs:
+  agent-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hour max for GitHub Actions
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better context
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install openai requests python-dotenv
+
+      - name: Extract task from issue
+        id: extract-task
+        run: |
+          python3 << 'EOF'
+          import os
+          import json
+          import re
+
+          # Get task details
+          if '${{ github.event_name }}' == 'issues':
+              # Triggered by issue
+              issue_title = '''${{ github.event.issue.title }}'''
+              issue_body = '''${{ github.event.issue.body }}'''
+              issue_number = '${{ github.event.issue.number }}'
+
+              # Extract task ID from body or title
+              task_id_match = re.search(r'Task ID:\s*(task-\S+)', issue_body)
+              task_id = task_id_match.group(1) if task_id_match else f'task-issue-{issue_number}'
+
+              # Extract prompt
+              prompt = issue_body
+          else:
+              # Workflow dispatch
+              task_id = '${{ github.event.inputs.task_id }}'
+              prompt = '${{ github.event.inputs.prompt }}'
+
+          # Save to files for next steps
+          with open('/tmp/task_info.json', 'w') as f:
+              json.dump({
+                  'task_id': task_id,
+                  'prompt': prompt,
+                  'issue_number': issue_number if '${{ github.event_name }}' == 'issues' else None
+              }, f)
+
+          print(f'Task ID: {task_id}')
+          print(f'Prompt: {prompt[:100]}...')
+          EOF
+
+      - name: Initialize task tracking
+        id: init
+        run: |
+          # Create task tracking
+          echo "TASK_START=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV
+
+          # Add initial comment to issue (if triggered by issue)
+          if [ '${{ github.event_name }}' == 'issues' ]; then
+            gh issue comment ${{ github.event.issue.number }} --body "## Agent Started
+
+            **Task ID**: ${{ env.TASK_ID }}
+            **Started**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            **Status**: Processing...
+
+            I will analyze the requirements and begin implementation shortly."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Execute coding task
+        id: execute
+        run: |
+          python3 << 'PYTHON_EOF'
+          import os
+          import json
+          import requests
+          import time
+          import subprocess
+          import sys
+
+          # Load task info
+          with open('/tmp/task_info.json') as f:
+              task_info = json.load(f)
+
+          task_id = task_info['task_id']
+          prompt = task_info['prompt']
+
+          print(f"Executing task: {task_id}")
+          print(f"Prompt: {prompt[:200]}...")
+
+          # Simple autonomous agent using free LLM
+          # This is a minimal implementation - for production, use ForgeCode or similar
+
+          def call_llm(messages, provider='groq'):
+              """Call LLM with fallback support"""
+              providers = [
+                  ('groq', 'https://api.groq.com/openai/v1', os.getenv('OPENAI_API_KEY'), 'llama-3.3-70b-versatile'),
+                  ('supacoder', 'https://supacoder.top/v1', os.getenv('SUPACODER_API_KEY'), 'gpt-5'),
+                  ('blazeai', 'https://blazeai.boxu.dev/v1', os.getenv('BLAZE_API_KEY'), 'gpt-5'),
+              ]
+
+              for name, base_url, api_key, model in providers:
+                  if not api_key:
+                      continue
+
+                  try:
+                      print(f"Trying provider: {name}")
+                      response = requests.post(
+                          f"{base_url}/chat/completions",
+                          headers={
+                              'Authorization': f'Bearer {api_key}',
+                              'Content-Type': 'application/json'
+                          },
+                          json={
+                              'model': model,
+                              'messages': messages,
+                              'temperature': 0.7,
+                              'max_tokens': 4000
+                          },
+                          timeout=120
+                      )
+
+                      if response.status_code == 200:
+                          return response.json()['choices'][0]['message']['content']
+                      else:
+                          print(f"Provider {name} failed: {response.status_code}")
+                  except Exception as e:
+                      print(f"Provider {name} error: {e}")
+                      continue
+
+              raise Exception("All providers failed")
+
+          # Step 1: Analyze the task
+          analysis_prompt = f"""Analyze this coding task and create a plan:
+
+          Task: {prompt}
+
+          Repository: {os.getcwd()}
+
+          Create a step-by-step implementation plan. Be specific about:
+          1. Files to create/modify
+          2. Key functions/classes needed
+          3. Dependencies to add
+          4. Tests to write
+
+          Format your response as a numbered list."""
+
+          print("Analyzing task...")
+          plan = call_llm([
+              {"role": "system", "content": "You are an expert software architect. Create concise, actionable implementation plans."},
+              {"role": "user", "content": analysis_prompt}
+          ])
+
+          print(f"Plan:\n{plan}")
+
+          # Step 2: Explore current codebase
+          print("\nExploring codebase...")
+          files = []
+          for root, dirs, filenames in os.walk('.'):
+              # Skip hidden and common non-code directories
+              dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__', 'venv', '.git']]
+              for filename in filenames:
+                  if filename.endswith(('.py', '.js', '.ts', '.json', '.yaml', '.md')):
+                      filepath = os.path.join(root, filename)
+                      files.append(filepath)
+
+          print(f"Found {len(files)} relevant files")
+
+          # Step 3: Generate implementation
+          impl_prompt = f"""Implement this task based on the plan:
+
+          Task: {prompt}
+
+          Plan:
+          {plan}
+
+          Current files in repo:
+          {chr(10).join(files[:20])}
+
+          For each file you need to create or modify, provide the complete content.
+          Use this format:
+
+          ### FILE: path/to/file.py
+          ```python
+          # file content here
+          ```
+
+          Only output files that need to be created or modified."""
+
+          print("\nGenerating implementation...")
+          impl = call_llm([
+              {"role": "system", "content": "You are an expert software developer. Write clean, well-tested code."},
+              {"role": "user", "content": impl_prompt}
+          ])
+
+          print(f"Implementation generated")
+
+          # Step 4: Parse and create files
+          print("\nCreating files...")
+          import re
+
+          file_pattern = r'### FILE:\s*(\S+)\s*```[\w]*\n(.*?)```'
+          matches = re.findall(file_pattern, impl, re.DOTALL)
+
+          created_files = []
+          for filepath, content in matches:
+              # Clean up filepath
+              filepath = filepath.strip()
+
+              # Create directory if needed
+              dirpath = os.path.dirname(filepath)
+              if dirpath:
+                  os.makedirs(dirpath, exist_ok=True)
+
+              # Write file
+              with open(filepath, 'w') as f:
+                  f.write(content.strip())
+
+              created_files.append(filepath)
+              print(f"Created: {filepath}")
+
+          print(f"\nCreated {len(created_files)} files")
+
+          # Save results
+          with open('/tmp/execution_result.json', 'w') as f:
+              json.dump({
+                  'task_id': task_id,
+                  'plan': plan,
+                  'implementation': impl,
+                  'created_files': created_files,
+                  'success': True
+              }, f)
+
+          print("\nExecution complete!")
+          PYTHON_EOF
+
+      - name: Run tests (if available)
+        id: test
+        continue-on-error: true
+        run: |
+          # Try to run tests if pytest or npm test available
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt || true
+          fi
+
+          if [ -f "pytest.ini" ] || [ -d "tests" ]; then
+            pip install pytest pytest-cov
+            pytest -v --tb=short || echo "Tests failed, continuing..."
+          elif [ -f "package.json" ]; then
+            npm test || echo "Tests failed, continuing..."
+          fi
+
+      - name: Create Pull Request
+        if: success()
+        id: pr
+        run: |
+          # Load execution result
+          RESULT=$(cat /tmp/execution_result.json)
+          TASK_ID=$(echo "$RESULT" | jq -r '.task_id')
+
+          # Create branch
+          BRANCH="agent/${TASK_ID}"
+          git config user.name "Agentic Orchestrator"
+          git config user.email "agent@orchestrator.dev"
+          git checkout -b "$BRANCH"
+
+          # Commit changes
+          git add -A
+          git commit -m "feat: Complete ${TASK_ID}
+
+          Automated implementation by agentic orchestrator.
+
+          Task: ${TASK_ID}
+          Files changed: $(git diff --name-only main 2>/dev/null || git diff --name-only HEAD~1)"
+
+          # Push branch
+          git push origin "$BRANCH"
+
+          # Create PR
+          PR_BODY="## Automated Implementation
+
+          **Task ID**: ${TASK_ID}
+
+          ### Changes
+          This PR was automatically generated by the agentic orchestrator to complete the task.
+
+          ### Files Changed
+          \`\`\`
+          $(git diff --name-only main 2>/dev/null || git diff --name-only HEAD~1)
+          \`\`\`
+
+          ### Verification
+          - [ ] Code follows project conventions
+          - [ ] Tests pass
+          - [ ] Documentation updated (if needed)
+
+          ---
+
+          *This PR was created automatically. Please review before merging.*"
+
+          PR_URL=$(gh pr create \
+            --title "Agent: Complete ${TASK_ID}" \
+            --body "$PR_BODY" \
+            --base main \
+            --head "$BRANCH" \
+            --label "agent-generated")
+
+          echo "PR_URL=$PR_URL" >> $GITHUB_ENV
+          echo "PR created: $PR_URL"
+
+          # Save PR info
+          echo "{\"pr_url\": \"$PR_URL\", \"branch\": \"$BRANCH\"}" > /tmp/pr_info.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Report completion
+        if: always()
+        run: |
+          # Load results
+          if [ -f '/tmp/execution_result.json' ]; then
+            TASK_ID=$(jq -r '.task_id' /tmp/execution_result.json)
+            SUCCESS=$(jq -r '.success' /tmp/execution_result.json)
+            FILES=$(jq -r '.created_files | join(", ")' /tmp/execution_result.json)
+          else
+            TASK_ID="${{ env.TASK_ID }}"
+            SUCCESS="false"
+            FILES=""
+          fi
+
+          # Get PR URL if created
+          PR_URL=""
+          if [ -f '/tmp/pr_info.json' ]; then
+            PR_URL=$(jq -r '.pr_url' /tmp/pr_info.json)
+          fi
+
+          # Create completion marker
+          MARKER="TASK_COMPLETE: ${TASK_ID}"
+
+          # Comment on issue if triggered by issue
+          if [ '${{ github.event_name }}' == 'issues' ]; then
+            COMMENT="## Task Completed
+
+            **Task ID**: ${TASK_ID}
+            **Status**: $([ "$SUCCESS" = "true" ] && echo "✅ Success" || echo "❌ Failed")
+            **Duration**: $(($(date +%s) - TASK_START)) seconds
+
+            ### Files Created/Modified
+            ${FILES:-None}
+
+            ### Pull Request
+            ${PR_URL:-No PR created}
+
+            ### Completion Marker
+            \`${MARKER}\`
+
+            ---
+
+            The agent has finished processing this task. Please review the PR and merge if acceptable."
+
+            gh issue comment ${{ github.event.issue.number }} --body "$COMMENT"
+
+            # Add completion label
+            gh issue edit ${{ github.event.issue.number }} --add-label "completed"
+          fi
+
+          # Output for workflow dispatch
+          echo "::notice::Task ${TASK_ID} completed. Success: ${SUCCESS}"
+          if [ -n "$PR_URL" ]; then
+            echo "::notice::PR URL: ${PR_URL}"
+          fi
+
+          echo "MARKER=${MARKER}" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TASK_START: ${{ env.TASK_START }}
+
+  # Optional: Review job using free LLM
+  review:
+    needs: agent-task
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Review implementation
+        run: |
+          python3 << 'EOF'
+          import os
+          import requests
+
+          # Simple review using free LLM
+          # Get the PR diff and review
+
+          api_key = os.getenv('GITHUB_TOKEN')
+          # Use GitHub API to get PR diff
+          # Then use free LLM to review
+
+          print("Review step - to be enhanced")
+          EOF
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
