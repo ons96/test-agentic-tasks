@@ -28,6 +28,9 @@ jobs:
         with:
           python-version: '3.11'
       
+      - name: Install dependencies
+        run: pip install requests
+      
       - name: Execute Task
         env:
           SUPACODER_API_KEY: ${{ secrets.SUPACODER_API_KEY }}
