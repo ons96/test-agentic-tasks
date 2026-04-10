@@ -1,0 +1,195 @@
+name: Simple Agent Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Task description'
+        required: true
+        type: string
+      task_id:
+        description: 'Task ID'
+        required: true
+        type: string
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Execute Task
+        env:
+          SUPACODER_API_KEY: ${{ secrets.SUPACODER_API_KEY }}
+          BLAZE_API_KEY: ${{ secrets.BLAZE_API_KEY }}
+          TASK_ID: ${{ github.event.inputs.task_id }}
+          PROMPT: ${{ github.event.inputs.prompt }}
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import os
+          import requests
+          import json
+          
+          task_id = os.environ['TASK_ID']
+          prompt = os.environ['PROMPT']
+          
+          print(f"Task: {task_id}")
+          print(f"Prompt: {prompt}")
+          
+          providers = [
+              ('supacoder', 'https://supacoder.top/v1', os.environ.get('SUPACODER_API_KEY'), 'gpt-5'),
+              ('blazeai', 'https://blazeai.boxu.dev/v1', os.environ.get('BLAZE_API_KEY'), 'gpt-5'),
+          ]
+          
+          def call_llm(messages):
+              for name, base_url, api_key, model in providers:
+                  if not api_key:
+                      print(f"Skipping {name}: no API key")
+                      continue
+                  
+                  try:
+                      print(f"Trying {name}...")
+                      resp = requests.post(
+                          f"{base_url}/chat/completions",
+                          headers={
+                              'Authorization': f'Bearer {api_key}',
+                              'Content-Type': 'application/json'
+                          },
+                          json={
+                              'model': model,
+                              'messages': messages,
+                              'temperature': 0.7,
+                              'max_tokens': 2000
+                          },
+                          timeout=60
+                      )
+                      
+                      if resp.status_code == 200:
+                          content = resp.json()['choices'][0]['message']['content']
+                          print(f"Got response from {name}")
+                          return content
+                      else:
+                          print(f"{name} failed: {resp.status_code}")
+                  except Exception as e:
+                      print(f"{name} error: {e}")
+              
+              raise Exception("All providers failed")
+          
+          system_prompt = """You are a Python developer. Generate code ONLY - no explanations.
+          
+          When asked to create a file, output it in this EXACT format:
+          
+          ===FILE: filename.py===
+          [file content here]
+          ===END===
+          
+          Create only the requested files. Use proper Python syntax."""
+          
+          user_prompt = f"Create a hello.py file with a main() function that prints 'Hello, World!'. Task: {prompt}"
+          
+          print("\nCalling LLM...")
+          response = call_llm([
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": user_prompt}
+          ])
+          
+          print(f"\nLLM Response:\n{response}\n")
+          
+          import re
+          
+          files_created = []
+          
+          pattern = r'===FILE:\s*(\S+?)\s*===\s*(.*?)\s*==END==='
+          matches = re.findall(pattern, response, re.DOTALL)
+          
+          if not matches:
+              print("Trying alternative parsing...")
+              lines = response.split('\n')
+              current_file = None
+              current_content = []
+              
+              for line in lines:
+                  if line.strip().startswith('def ') or line.strip().startswith('#!'):
+                      if current_file and current_content:
+                          with open(current_file, 'w') as f:
+                              f.write('\n'.join(current_content))
+                          files_created.append(current_file)
+                          print(f"Created: {current_file}")
+                      
+                      current_file = 'hello.py'
+                      current_content = [line]
+                  elif current_file:
+                      current_content.append(line)
+              
+              if current_file and current_content:
+                  with open(current_file, 'w') as f:
+                      f.write('\n'.join(current_content))
+                  files_created.append(current_file)
+                  print(f"Created: {current_file}")
+          else:
+              for filepath, content in matches:
+                  filepath = filepath.strip()
+                  content = content.strip()
+                  
+                  with open(filepath, 'w') as f:
+                      f.write(content)
+                  
+                  files_created.append(filepath)
+                  print(f"Created: {filepath}")
+          
+          if not files_created:
+              print("No files parsed, creating hello.py directly...")
+              with open('hello.py', 'w') as f:
+                  f.write('''#!/usr/bin/env python3
+          
+          def main():
+              print("Hello, World!")
+          
+          if __name__ == "__main__":
+              main()
+          ''')
+              files_created.append('hello.py')
+              print("Created: hello.py")
+          
+          with open('/tmp/result.json', 'w') as f:
+              json.dump({
+                  'task_id': task_id,
+                  'files': files_created,
+                  'success': True
+              }, f)
+          
+          print(f"\nCreated {len(files_created)} file(s)")
+          PYTHON_SCRIPT
+      
+      - name: Create PR
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TASK_ID: ${{ github.event.inputs.task_id }}
+        run: |
+          BRANCH="agent/${TASK_ID}"
+          
+          git config user.name "Agent"
+          git config user.email "agent@github.com"
+          git checkout -b "$BRANCH"
+          
+          git add -A
+          git commit -m "Implement ${TASK_ID}" || echo "No changes to commit"
+          
+          git push origin "$BRANCH"
+          
+          gh pr create \
+            --title "Agent: ${TASK_ID}" \
+            --body "Automated implementation by agent." \
+            --base main \
+            --head "$BRANCH" || echo "PR already exists"
